@@ -1,0 +1,27 @@
+# Environment and secrets
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local datasets and databases
+data/bird/dev_databases/
+data/spider/database/
+spider_full/
+*.sqlite
+*.sqlite3
+*.db
+
+# Generated files
+outputs/
+results/
+logs/
+models/
+checkpoints/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,20 @@
+[
+  {
+    "question_id": "q1",
+    "db_id": "sample_retail",
+    "question": "What is the total sales amount for completed orders?",
+    "gold_sql": "SELECT SUM(oi.line_total) FROM orders o JOIN order_items oi ON o.order_id = oi.order_id WHERE o.status = 'completed';"
+  },
+  {
+    "question_id": "q2",
+    "db_id": "sample_retail",
+    "question": "How many customers are from Dublin?",
+    "gold_sql": "SELECT COUNT(*) FROM customers WHERE city = 'Dublin';"
+  },
+  {
+    "question_id": "q3",
+    "db_id": "sample_retail",
+    "question": "Which product category has the highest total sales?",
+    "gold_sql": "SELECT p.category FROM products p JOIN order_items oi ON p.product_id = oi.product_id JOIN orders o ON oi.order_id = o.order_id WHERE o.status = 'completed' GROUP BY p.category ORDER BY SUM(oi.line_total) DESC LIMIT 1;"
+  }
+]
