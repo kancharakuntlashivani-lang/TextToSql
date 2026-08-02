@@ -8,6 +8,7 @@ from src.datasets_manager import DATASETS, download_dataset, load_all, load_data
 from src.experiment import run_experiment
 from src.ml_models import train_models
 from src.statistics import dataset_comparison_test
+from src.core import database_health, list_databases, run_strategy
 
 st.set_page_config(page_title='Text-to-SQL Lab', page_icon='☁️', layout='wide', initial_sidebar_state='collapsed')
 
@@ -47,26 +48,147 @@ def get_results():
     return pd.read_csv(path) if path.exists() else pd.DataFrame()
 
 if page == 'Ask':
-    st.markdown('<div class="hero"><h1>Ask questions. Compare methods.</h1><p>A simple research application for comparing schema-context strategies across BIRD Mini-Dev and Spider.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>Ask a database question</h1><p>Enter your own question or select a benchmark question. The application generates PostgreSQL, executes it, and shows whether it matches the expected result when ground truth is available.</p></div>', unsafe_allow_html=True)
+
+    if not database_health():
+        st.error('PostgreSQL is not connected. Check DATABASE_URL / SQLALCHEMY_URL in Render.')
+        st.stop()
+
     frame = cached_all()
     if frame.empty:
         st.error('Datasets could not be loaded. Open the Datasets page and retry the download.')
+        st.stop()
+
+    display_to_key = {'BIRD Mini-Dev': 'bird', 'Spider': 'spider'}
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 1.2, 1])
+    dataset_name = c1.selectbox('Dataset', list(DATASETS))
+    dataset_key = display_to_key[dataset_name]
+
+    available_databases = list_databases(dataset_key)
+    if not available_databases:
+        st.error(f'No migrated PostgreSQL schemas were found for {dataset_name}.')
+        st.stop()
+
+    subset = frame[frame['dataset'] == dataset_name].copy()
+    benchmark_databases = set(subset['db_id'].astype(str))
+    database_options = [db for db in available_databases if db in benchmark_databases]
+    if not database_options:
+        database_options = available_databases
+
+    db_id = c2.selectbox('Database', sorted(database_options))
+    strategy_label = c3.selectbox(
+        'Schema strategy',
+        ['Relevant schema (Top-5)', 'Full schema', 'Top-1', 'Top-3'],
+    )
+    strategy_map = {
+        'Relevant schema (Top-5)': 'top_5',
+        'Full schema': 'full',
+        'Top-1': 'top_1',
+        'Top-3': 'top_3',
+    }
+
+    mode = st.radio(
+        'Question mode',
+        ['Enter my own question', 'Use benchmark question'],
+        horizontal=True,
+    )
+
+    gold_sql = ''
+    benchmark_record = None
+
+    if mode == 'Use benchmark question':
+        examples = subset[subset['db_id'].astype(str) == str(db_id)].head(200)
+        if examples.empty:
+            st.warning('No benchmark questions were found for this migrated database. Use your own question instead.')
+            question = st.text_area('Question', height=110, placeholder='Example: Show the five customers with the highest total payments.')
+        else:
+            selected = st.selectbox('Benchmark question', examples['question'].tolist())
+            benchmark_record = examples[examples['question'] == selected].iloc[0]
+            question = st.text_area('Question', value=str(benchmark_record['question']), height=110)
+            gold_sql = str(benchmark_record['gold_sql'])
+            st.caption('Ground-truth SQL is available, so the application can show Correct or Incorrect.')
     else:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        c1, c2 = st.columns(2)
-        dataset_name = c1.selectbox('Dataset', list(DATASETS))
-        subset = frame[frame['dataset'] == dataset_name]
-        db_id = c2.selectbox('Database', sorted(subset['db_id'].unique().tolist()))
-        examples = subset[subset['db_id'] == db_id].head(100)
-        selected = st.selectbox('Benchmark question', examples['question'].tolist())
-        record = examples[examples['question'] == selected].iloc[0]
-        st.text_area('Question', value=record['question'], height=105, disabled=True)
-        st.caption('The benchmark answer is shown for inspection. Live generation is performed from the Experiment page so comparisons remain controlled.')
-        if st.button('Show benchmark SQL', use_container_width=True):
-            st.session_state['benchmark_sql'] = record['gold_sql']
-        if st.session_state.get('benchmark_sql'):
-            st.code(st.session_state['benchmark_sql'], language='sql')
-        st.markdown('</div>', unsafe_allow_html=True)
+        question = st.text_area(
+            'Enter your natural-language question',
+            height=110,
+            placeholder='Example: Show the five customers with the highest total payments.',
+        )
+        with st.expander('Optional: provide expected SQL to verify correctness'):
+            gold_sql = st.text_area(
+                'Expected SQL',
+                height=120,
+                placeholder='Leave empty when the correct answer is not known.',
+            )
+            st.caption('Without expected SQL, the application can show validity and execution success, but it cannot scientifically claim accuracy.')
+
+    generate = st.button('Generate and run SQL', use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if generate:
+        if not question.strip():
+            st.warning('Enter a question first.')
+        else:
+            with st.spinner('Retrieving schema, generating SQL and executing the query...'):
+                try:
+                    result = run_strategy(
+                        question=question.strip(),
+                        db_id=db_id,
+                        strategy=strategy_map[strategy_label],
+                        gold_sql=gold_sql.strip() or None,
+                        dataset=dataset_key,
+                    )
+                    st.session_state['ask_result'] = result
+                except Exception as exc:
+                    st.error(f'Generation failed: {exc}')
+
+    result = st.session_state.get('ask_result')
+    if result and result.get('question') == question.strip() and result.get('db_id') == db_id:
+        st.subheader('Generated SQL')
+        st.code(result['generated_sql'], language='sql')
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric('SQL valid / executed', 'Yes' if result['success'] else 'No')
+        m2.metric('Generation time', f"{result['generation_latency']:.2f} s")
+        m3.metric('Execution time', f"{result['execution_time']:.3f} s")
+        m4.metric('Prompt tokens', int(result['prompt_tokens']))
+
+        if result.get('retrieved_tables'):
+            with st.expander('Schema tables supplied to the model'):
+                st.write(result['retrieved_tables'])
+
+        if result['success']:
+            st.success('The SQL is valid and executed successfully.')
+            if result.get('rows'):
+                st.dataframe(
+                    pd.DataFrame(result['rows'], columns=result['columns']),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info('The query executed successfully but returned no rows.')
+        else:
+            st.error(result.get('error') or 'The generated SQL could not be executed.')
+
+        if gold_sql.strip():
+            st.subheader('Correctness check')
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown('**Expected SQL**')
+                st.code(gold_sql, language='sql')
+            with c2:
+                st.markdown('**Evaluation**')
+                execution_correct = result.get('execution_accuracy') == 1
+                exact_correct = result.get('exact_match') == 1
+                if execution_correct:
+                    st.success('TRUE — generated SQL returned the expected result.')
+                else:
+                    st.error('FALSE — generated SQL did not return the expected result.')
+                st.write(f"Exact SQL match: {'Yes' if exact_correct else 'No'}")
+                st.write(f"Execution-result match: {'Yes' if execution_correct else 'No'}")
+        else:
+            st.info('Accuracy is not available for this custom question because no verified expected SQL was supplied.')
 
 elif page == 'Datasets':
     st.header('Datasets')
