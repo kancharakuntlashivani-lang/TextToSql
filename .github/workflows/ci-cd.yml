@@ -94,8 +94,14 @@ jobs:
             --fail \
             --show-error \
             --silent \
-            --request POST \
-            "${RENDER_DEPLOY_HOOK_URL}?ref=${GITHUB_SHA}"
+            --location \
+            "$RENDER_DEPLOY_HOOK_URL"
 
           echo
           echo "Render deployment triggered successfully."
+
+      - name: Show deployed application URL
+        env:
+          RENDER_SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+        run: |
+          echo "Application URL: $RENDER_SERVICE_URL"
