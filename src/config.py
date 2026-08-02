@@ -1,14 +1,69 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
 
+# ------------------------------------------------------------------
+# Project root and environment loading
+# ------------------------------------------------------------------
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
 load_dotenv(ROOT_DIR / ".env")
+
+
+# ------------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------------
+
+def get_env(
+    name: str,
+    default: str = "",
+) -> str:
+    """
+    Read an environment variable safely.
+
+    Empty Render environment variables are treated as missing values.
+    """
+
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    value = str(value).strip()
+
+    if not value:
+        return default
+
+    return value
+
+
+def get_int_env(
+    name: str,
+    default: int,
+) -> int:
+    """
+    Read an integer environment variable safely.
+
+    Prevents errors such as:
+    ValueError: invalid literal for int() with base 10: ''
+    """
+
+    value = get_env(
+        name,
+        str(default),
+    )
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ------------------------------------------------------------------
@@ -49,66 +104,110 @@ for folder in (
 # OpenAI configuration
 # ------------------------------------------------------------------
 
-OPENAI_API_KEY = (
-    os.getenv("OPENAI_API_KEY") or ""
-).strip()
+OPENAI_API_KEY = get_env(
+    "OPENAI_API_KEY",
+    "",
+)
 
-OPENAI_MODEL = (
-    os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-).strip()
+OPENAI_MODEL = get_env(
+    "OPENAI_MODEL",
+    get_env(
+        "LLM_MODEL",
+        "gpt-4o-mini",
+    ),
+)
 
+# core.py may read LLM_MODEL.
 LLM_MODEL = OPENAI_MODEL
 
-DEFAULT_PROVIDER = (
-    os.getenv("DEFAULT_PROVIDER")
-    or os.getenv("LLM_PROVIDER")
-    or "OpenAI"
-).strip()
+LLM_PROVIDER = get_env(
+    "LLM_PROVIDER",
+    get_env(
+        "DEFAULT_PROVIDER",
+        "openai",
+    ),
+).lower()
+
+DEFAULT_PROVIDER = LLM_PROVIDER
 
 
 # ------------------------------------------------------------------
 # PostgreSQL configuration
 # ------------------------------------------------------------------
 
-DB_HOST = (
-    os.getenv("DB_HOST") or "localhost"
-).strip()
+DB_HOST = get_env(
+    "DB_HOST",
+    "localhost",
+)
 
-DB_NAME = (
-    os.getenv("DB_NAME") or "text2sql_rag"
-).strip()
+DB_PORT = get_int_env(
+    "DB_PORT",
+    5432,
+)
 
-DB_USER = (
-    os.getenv("DB_USER") or "postgres"
-).strip()
+DB_NAME = get_env(
+    "DB_NAME",
+    "text2sql_rag",
+)
 
-DB_PASSWORD = os.getenv("DB_PASSWORD") or ""
+DB_USER = get_env(
+    "DB_USER",
+    "postgres",
+)
 
-db_port_value = (
-    os.getenv("DB_PORT") or "5432"
-).strip()
-
-try:
-    DB_PORT = int(db_port_value)
-except ValueError:
-    DB_PORT = 5432
+DB_PASSWORD = get_env(
+    "DB_PASSWORD",
+    "",
+)
 
 
-def normalise_database_url(value: str) -> str:
+def normalise_database_url(
+    value: str,
+) -> str:
     """
-    Convert a PostgreSQL URL into a SQLAlchemy-compatible URL.
+    Convert a Render PostgreSQL URL into a SQLAlchemy-compatible URL.
+
+    Supported inputs:
+        postgres://user:password@host/database
+        postgresql://user:password@host/database
+        postgresql://user:password@host:5432/database
+        postgresql+psycopg2://user:password@host/database
+
+    The function also repairs an accidental empty port such as:
+        host:/database
     """
 
     url = str(value or "").strip()
 
+    # Remove accidental quotes copied from environment settings.
     url = url.strip('"').strip("'")
 
+    # Remove spaces and line breaks accidentally copied into Render.
+    url = re.sub(
+        r"\s+",
+        "",
+        url,
+    )
+
+    if not url:
+        return ""
+
+    # Render or other providers may return postgres://.
     if url.startswith("postgres://"):
         url = (
             "postgresql://"
             + url[len("postgres://"):]
         )
 
+    # Repair a malformed empty port:
+    # hostname:/database -> hostname/database
+    url = re.sub(
+        r"(@[^/?#:]+):/([^/])",
+        r"\1/\2",
+        url,
+    )
+
+    # The project installs psycopg2-binary.
     if url.startswith("postgresql://"):
         url = (
             "postgresql+psycopg2://"
@@ -118,25 +217,46 @@ def normalise_database_url(value: str) -> str:
     return url
 
 
-render_database_url = (
-    os.getenv("SQLALCHEMY_URL")
-    or os.getenv("DATABASE_URL")
-    or ""
-).strip()
+# DATABASE_URL is the main Render variable.
+# SQLALCHEMY_URL is accepted only as a fallback.
+raw_database_url = get_env(
+    "DATABASE_URL",
+    get_env(
+        "SQLALCHEMY_URL",
+        "",
+    ),
+)
 
 
-if render_database_url:
+if raw_database_url:
     DATABASE_URL = normalise_database_url(
-        render_database_url
+        raw_database_url
     )
 else:
+    # Local development fallback using separate DB variables.
+    encoded_user = quote_plus(
+        DB_USER
+    )
+
+    encoded_password = quote_plus(
+        DB_PASSWORD
+    )
+
     DATABASE_URL = (
-        f"postgresql+psycopg2://"
-        f"{DB_USER}:"
-        f"{DB_PASSWORD}@"
+        "postgresql+psycopg2://"
+        f"{encoded_user}:"
+        f"{encoded_password}@"
         f"{DB_HOST}:"
         f"{DB_PORT}/"
         f"{DB_NAME}"
+    )
+
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "PostgreSQL configuration is missing. "
+        "Set DATABASE_URL in Render or configure "
+        "DB_HOST, DB_PORT, DB_NAME, DB_USER and DB_PASSWORD."
     )
 
 
@@ -148,15 +268,25 @@ SQLALCHEMY_URL = DATABASE_URL
 # Application settings
 # ------------------------------------------------------------------
 
-max_rows_value = (
-    os.getenv("MAX_RESULT_ROWS") or "200"
-).strip()
+MAX_RESULT_ROWS = get_int_env(
+    "MAX_RESULT_ROWS",
+    200,
+)
 
-try:
-    MAX_RESULT_ROWS = int(max_rows_value)
-except ValueError:
-    MAX_RESULT_ROWS = 200
+TOP_K_TABLES = get_int_env(
+    "TOP_K_TABLES",
+    5,
+)
 
+OUTPUT_DIR_NAME = get_env(
+    "OUTPUT_DIR",
+    "outputs",
+)
+
+
+# ------------------------------------------------------------------
+# Dataset configuration
+# ------------------------------------------------------------------
 
 DATASETS = {
     "bird": {
@@ -196,6 +326,48 @@ DATASETS = {
 }
 
 
+# ------------------------------------------------------------------
+# PostgreSQL schema-name helper
+# ------------------------------------------------------------------
+
+def clean_identifier(
+    value: str,
+) -> str:
+    """
+    Convert a dataset or database name into a safe PostgreSQL identifier.
+    """
+
+    cleaned = (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    cleaned = re.sub(
+        r"[^a-z0-9_]",
+        "_",
+        cleaned,
+    )
+
+    cleaned = re.sub(
+        r"_+",
+        "_",
+        cleaned,
+    ).strip("_")
+
+    if not cleaned:
+        raise ValueError(
+            "PostgreSQL identifier cannot be empty."
+        )
+
+    if cleaned[0].isdigit():
+        cleaned = f"db_{cleaned}"
+
+    return cleaned[:63]
+
+
 def postgres_schema_name(
     dataset: str,
     db_id: str,
@@ -208,20 +380,12 @@ def postgres_schema_name(
         spider_concert_singer
     """
 
-    dataset_name = (
-        str(dataset)
-        .strip()
-        .lower()
-        .replace("-", "_")
-        .replace(" ", "_")
+    dataset_name = clean_identifier(
+        dataset
     )
 
-    database_name = (
-        str(db_id)
-        .strip()
-        .lower()
-        .replace("-", "_")
-        .replace(" ", "_")
+    database_name = clean_identifier(
+        db_id
     )
 
     if dataset_name not in {
@@ -233,12 +397,36 @@ def postgres_schema_name(
             "'bird' or 'spider'."
         )
 
-    if not database_name:
-        raise ValueError(
-            "Database ID cannot be empty."
-        )
+    # Avoid adding the same dataset prefix twice.
+    prefix = f"{dataset_name}_"
+
+    if database_name.startswith(prefix):
+        return database_name
 
     return (
         f"{dataset_name}_"
         f"{database_name}"
     )
+
+
+# ------------------------------------------------------------------
+# Safe diagnostic information
+# ------------------------------------------------------------------
+
+def database_configuration_summary() -> dict[str, object]:
+    """
+    Return database configuration details without exposing credentials.
+    """
+
+    return {
+        "database_url_configured": bool(
+            raw_database_url
+        ),
+        "database_driver": (
+            "postgresql+psycopg2"
+        ),
+        "local_fallback_host": DB_HOST,
+        "local_fallback_port": DB_PORT,
+        "local_fallback_database": DB_NAME,
+        "max_result_rows": MAX_RESULT_ROWS,
+    }
