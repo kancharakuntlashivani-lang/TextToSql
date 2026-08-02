@@ -8,7 +8,8 @@ from src.datasets_manager import DATASETS, download_dataset, load_all, load_data
 from src.experiment import run_experiment
 from src.ml_models import train_models
 from src.statistics import dataset_comparison_test
-from src.core import database_health, list_databases, run_strategy
+from src import core
+from src.core import list_databases, run_strategy
 
 st.set_page_config(page_title='Text-to-SQL Lab', page_icon='☁️', layout='wide', initial_sidebar_state='collapsed')
 
@@ -50,8 +51,21 @@ def get_results():
 if page == 'Ask':
     st.markdown('<div class="hero"><h1>Ask a database question</h1><p>Enter your own question or select a benchmark question. The application generates PostgreSQL, executes it, and shows whether it matches the expected result when ground truth is available.</p></div>', unsafe_allow_html=True)
 
-    if not database_health():
-        st.error('PostgreSQL is not connected. Check DATABASE_URL / SQLALCHEMY_URL in Render.')
+    if not core.database_health():
+        st.error('PostgreSQL connection failed.')
+
+        if getattr(core, 'DATABASE_HEALTH_ERROR', ''):
+            st.code(
+                core.DATABASE_HEALTH_ERROR,
+                language='text',
+            )
+
+        st.info(
+            'Check DATABASE_URL in the Render web-service environment. '
+            'Use the exact Internal Database URL from the Render PostgreSQL service. '
+            'Also confirm that the web service and PostgreSQL database use the same region.'
+        )
+
         st.stop()
 
     frame = cached_all()
