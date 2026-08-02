@@ -153,14 +153,25 @@ def postgres_schema_name(
     )
 
 
+DATABASE_HEALTH_ERROR = ""
+
+
 def database_health() -> bool:
-    """Return True when PostgreSQL is reachable."""
+    """Return True when PostgreSQL is reachable and expose the real error."""
+
+    global DATABASE_HEALTH_ERROR
 
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
+
+        DATABASE_HEALTH_ERROR = ""
+        print("PostgreSQL connection successful.", flush=True)
         return True
-    except Exception:
+
+    except Exception as exc:
+        DATABASE_HEALTH_ERROR = f"{type(exc).__name__}: {exc}"
+        print("POSTGRESQL CONNECTION ERROR:", DATABASE_HEALTH_ERROR, flush=True)
         return False
 
 
