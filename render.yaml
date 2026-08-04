@@ -3,12 +3,31 @@ services:
     name: shivani-text2sql-research
     runtime: docker
     plan: free
+
     dockerfilePath: ./Dockerfile
     healthCheckPath: /_stcore/health
+
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
+
+      - key: DATABASE_URL
+        sync: false
+
       - key: OPENAI_API_KEY
         sync: false
+
       - key: OPENAI_MODEL
         value: gpt-4o-mini
+
+      - key: LLM_MODEL
+        value: gpt-4o-mini
+
+      - key: LLM_PROVIDER
+        value: openai
+
+      - key: OUTPUT_DIR
+        value: outputs
+
+      - key: MAX_RESULT_ROWS
+        value: "200"
