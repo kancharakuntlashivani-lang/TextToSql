@@ -110,6 +110,7 @@ if page == 'Ask':
     )
 
     gold_sql = ''
+    evidence = ''
     benchmark_record = None
 
     if mode == 'Use benchmark question':
@@ -121,8 +122,14 @@ if page == 'Ask':
             selected = st.selectbox('Benchmark question', examples['question'].tolist())
             benchmark_record = examples[examples['question'] == selected].iloc[0]
             question = st.text_area('Question', value=str(benchmark_record['question']), height=110)
-            gold_sql = str(benchmark_record['gold_sql'])
+            gold_sql = str(benchmark_record.get('gold_sql', '') or '')
+            evidence = str(benchmark_record.get('evidence', '') or '').strip()
+
             st.caption('Ground-truth SQL is available, so the application can show Correct or Incorrect.')
+
+            if evidence:
+                with st.expander('Benchmark evidence / hint'):
+                    st.write(evidence)
     else:
         question = st.text_area(
             'Enter your natural-language question',
@@ -152,6 +159,7 @@ if page == 'Ask':
                         strategy=strategy_map[strategy_label],
                         gold_sql=gold_sql.strip() or None,
                         dataset=dataset_key,
+                        evidence=evidence or None,
                     )
                     st.session_state['ask_result'] = result
                 except Exception as exc:
@@ -172,8 +180,12 @@ if page == 'Ask':
             with st.expander('Schema tables supplied to the model'):
                 st.write(result['retrieved_tables'])
 
+        if result.get('evidence'):
+            with st.expander('Evidence supplied to the model'):
+                st.write(result['evidence'])
+
         if result['success']:
-            st.success('The SQL is valid and executed successfully.')
+            st.success('The SQL is valid and executed successfully. Execution success does not by itself prove the answer is correct.')
             if result.get('rows'):
                 st.dataframe(
                     pd.DataFrame(result['rows'], columns=result['columns']),
