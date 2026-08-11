@@ -605,6 +605,13 @@ STRICT RULES
 11. Return SQL only.
 12. Do not return markdown.
 13. Do not provide explanations or comments.
+14. Identify the main entity requested by the natural-language question before writing the SELECT clause.
+15. For questions asking "how many" entities, count the requested entity rather than joined rows.
+16. When joins can create duplicate rows, use COUNT(DISTINCT <entity identifier>) instead of COUNT(*).
+17. Choose the DISTINCT column from the table that represents the entity requested by the question.
+18. Do not use COUNT(*) after a one-to-many join when the question asks for the number of unique entities.
+19. Prefer semantically equivalent SQL over textual similarity to benchmark SQL.
+20. If BENCHMARK EVIDENCE / HINT defines the meaning of a coded value, use that mapping exactly.
 """.strip()
 
     started_at = time.perf_counter()
@@ -825,7 +832,7 @@ def execution_accuracy(
     db_id: str,
     dataset: str | None = None,
 ) -> int | None:
-    """Compare predicted and benchmark result sets."""
+    """Compare predicted and benchmark result sets; SQL text may differ while results still match."""
 
     if not gold_sql:
         return None
@@ -988,8 +995,10 @@ def discover_question_file(
     if dataset_key == "bird":
         root = Path(config.BIRD_DATA_DIR)
         preferred = [
-            root / "mini_dev_sqlite.json",
+            root / "mini_dev_postgresql.json",
             root / "dev.json",
+            root / "mini_dev_sqlite.json",
+            root / "mini_dev_data" / "mini_dev_postgresql.json",
             root / "mini_dev_data" / "mini_dev_sqlite.json",
         ]
     else:
