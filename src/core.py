@@ -812,6 +812,174 @@ def execute_sql(
         )
 
 
+SQL_KEYWORDS = {
+    "select", "from", "where", "join", "inner", "left", "right", "full",
+    "outer", "cross", "on", "as", "and", "or", "not", "null", "is",
+    "in", "exists", "between", "like", "ilike", "distinct", "count",
+    "sum", "avg", "min", "max", "group", "by", "having", "order",
+    "asc", "desc", "limit", "offset", "union", "all", "case", "when",
+    "then", "else", "end", "with", "true", "false", "cast", "coalesce",
+    "over", "partition", "rows", "range", "current", "row"
+}
+
+
+def quote_known_identifiers(
+    sql_query: str,
+    db_id: str,
+    dataset: str | None = None,
+) -> str:
+    """
+    Quote table and column identifiers using the actual PostgreSQL schema.
+
+    BIRD and Spider benchmark SQL often contains identifiers such as CDSCode
+    without PostgreSQL double quotes. The migration preserves the original
+    mixed-case SQLite identifiers, so unquoted benchmark SQL can fail because
+    PostgreSQL folds unquoted names to lowercase.
+
+    This function rewrites only SQL text outside string literals and existing
+    double-quoted identifiers.
+    """
+
+    raw_sql = str(sql_query or "").strip()
+
+    if not raw_sql:
+        return raw_sql
+
+    tables = schema_metadata(
+        db_id=db_id,
+        dataset=dataset,
+    )
+
+    canonical: dict[str, str] = {}
+
+    for table_name, columns in tables.items():
+        canonical[str(table_name).lower()] = str(table_name)
+
+        for column in columns:
+            name = str(column["name"])
+            canonical[name.lower()] = name
+
+    if not canonical:
+        return raw_sql
+
+    # Longer identifiers first to reduce partial-match risk.
+    names = sorted(
+        canonical,
+        key=len,
+        reverse=True,
+    )
+
+    token_pattern = re.compile(
+        r"\b(" + "|".join(re.escape(name) for name in names) + r")\b",
+        flags=re.IGNORECASE,
+    )
+
+    def replace_unquoted(segment: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            token = match.group(0)
+            lowered = token.lower()
+
+            # Do not quote SQL syntax words even if a schema identifier shares
+            # the same spelling. Qualified identifiers are still handled when
+            # they are not SQL keywords.
+            if lowered in SQL_KEYWORDS:
+                return token
+
+            actual = canonical.get(lowered)
+
+            if actual is None:
+                return token
+
+            return quote_identifier(actual)
+
+        return token_pattern.sub(repl, segment)
+
+    output: list[str] = []
+    buffer: list[str] = []
+    state = "normal"
+    i = 0
+
+    while i < len(raw_sql):
+        char = raw_sql[i]
+
+        if state == "normal":
+            if char == "'":
+                if buffer:
+                    output.append(replace_unquoted("".join(buffer)))
+                    buffer = []
+
+                output.append(char)
+                state = "single"
+                i += 1
+                continue
+
+            if char == '"':
+                if buffer:
+                    output.append(replace_unquoted("".join(buffer)))
+                    buffer = []
+
+                output.append(char)
+                state = "double"
+                i += 1
+                continue
+
+            buffer.append(char)
+            i += 1
+            continue
+
+        if state == "single":
+            output.append(char)
+
+            if char == "'":
+                # SQL escapes a single quote by doubling it.
+                if i + 1 < len(raw_sql) and raw_sql[i + 1] == "'":
+                    output.append(raw_sql[i + 1])
+                    i += 2
+                    continue
+
+                state = "normal"
+
+            i += 1
+            continue
+
+        # Existing double-quoted PostgreSQL identifier.
+        output.append(char)
+
+        if char == '"':
+            if i + 1 < len(raw_sql) and raw_sql[i + 1] == '"':
+                output.append(raw_sql[i + 1])
+                i += 2
+                continue
+
+            state = "normal"
+
+        i += 1
+
+    if buffer:
+        output.append(replace_unquoted("".join(buffer)))
+
+    return "".join(output)
+
+
+def prepare_gold_sql_for_postgres(
+    gold_sql: str | None,
+    db_id: str,
+    dataset: str | None = None,
+) -> str | None:
+    """
+    Convert benchmark SQL into executable PostgreSQL SQL for the migrated schema.
+    """
+
+    if not gold_sql:
+        return None
+
+    return quote_known_identifiers(
+        sql_query=gold_sql,
+        db_id=db_id,
+        dataset=dataset,
+    )
+
+
 # ============================================================
 # Evaluation
 # ============================================================
@@ -832,10 +1000,24 @@ def execution_accuracy(
     db_id: str,
     dataset: str | None = None,
 ) -> int | None:
-    """Compare predicted and benchmark result sets; SQL text may differ while results still match."""
+    """
+    Compare predicted and benchmark result sets.
+
+    Exact SQL text is not required. A prediction is correct when its executed
+    result is equivalent to the benchmark query result.
+
+    Benchmark SQL is first adapted to the migrated PostgreSQL schema so that
+    mixed-case BIRD/Spider identifiers execute correctly.
+    """
 
     if not gold_sql:
         return None
+
+    prepared_gold_sql = prepare_gold_sql_for_postgres(
+        gold_sql=gold_sql,
+        db_id=db_id,
+        dataset=dataset,
+    )
 
     (
         predicted_success,
@@ -853,23 +1035,39 @@ def execution_accuracy(
         gold_success,
         gold_columns,
         gold_rows,
-        _,
+        gold_error,
         _,
     ) = execute_sql(
-        sql_query=gold_sql,
+        sql_query=prepared_gold_sql or gold_sql,
         db_id=db_id,
         dataset=dataset,
     )
 
-    if not predicted_success or not gold_success:
+    if not predicted_success:
         return 0
 
+    if not gold_success:
+        print(
+            "GOLD SQL EXECUTION ERROR:",
+            gold_error,
+            flush=True,
+        )
+        print(
+            "PREPARED GOLD SQL:",
+            prepared_gold_sql,
+            flush=True,
+        )
+        return 0
+
+    # Strongest equality: same column labels and same row order/content.
     if (
         predicted_columns == gold_columns
         and predicted_rows == gold_rows
     ):
         return 1
 
+    # For benchmark execution accuracy, different aliases or ordering can still
+    # represent the same answer. Compare row values independent of row order.
     predicted_set = sorted(
         map(repr, predicted_rows)
     )
@@ -971,6 +1169,15 @@ def run_strategy(
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "exact_match": exact_match,
+        "prepared_gold_sql": (
+            prepare_gold_sql_for_postgres(
+                gold_sql=gold_sql,
+                db_id=clean_db_id,
+                dataset=dataset_key,
+            )
+            if gold_sql
+            else None
+        ),
         "execution_accuracy": execution_accuracy(
             predicted_sql=generated_sql,
             gold_sql=gold_sql,
@@ -995,10 +1202,8 @@ def discover_question_file(
     if dataset_key == "bird":
         root = Path(config.BIRD_DATA_DIR)
         preferred = [
-            root / "mini_dev_postgresql.json",
-            root / "dev.json",
             root / "mini_dev_sqlite.json",
-            root / "mini_dev_data" / "mini_dev_postgresql.json",
+            root / "dev.json",
             root / "mini_dev_data" / "mini_dev_sqlite.json",
         ]
     else:
