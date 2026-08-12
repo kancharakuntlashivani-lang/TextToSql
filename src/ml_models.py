@@ -49,7 +49,7 @@ FEATURES_CATEGORY = [
     "difficulty",
 ]
 
-TARGET = "exact_match"
+TARGET = "execution_accuracy"
 
 GROUP_COLUMN = "question"
 
@@ -171,7 +171,7 @@ def train_models(
 ) -> dict:
     """
     Train and compare classifiers that predict whether generated
-    SQL will exactly match the benchmark SQL.
+    SQL will return the same result as the benchmark SQL.
 
     The split is grouped by natural-language question to prevent
     the same question appearing in both training and testing data.
@@ -215,6 +215,15 @@ def train_models(
 
     data = data[
         data[TARGET].notna()
+    ].copy()
+
+    data[TARGET] = pd.to_numeric(
+        data[TARGET],
+        errors="coerce",
+    )
+
+    data = data[
+        data[TARGET].isin([0, 1])
     ].copy()
 
     data[TARGET] = (
@@ -605,6 +614,11 @@ def train_models(
     # --------------------------------------------------------
 
     evaluation_info = {
+        "target": TARGET,
+        "target_definition": (
+            "1 = generated SQL returned the same result as the benchmark SQL; "
+            "0 = execution result did not match."
+        ),
         "total_rows": int(
             len(data)
         ),
