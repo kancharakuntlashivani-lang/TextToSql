@@ -19,7 +19,12 @@ from src.datasets_manager import (
 )
 from src.experiment import run_experiment
 from src.ml_models import train_models
-from src.statistics import dataset_comparison_test
+from src.statistics import (
+    dataset_comparison_test,
+    all_strategy_tests,
+    strategy_efficiency_test,
+    complete_statistical_analysis,
+)
 from src import core
 from src.core import (
     list_databases,
@@ -469,8 +474,8 @@ elif page == 'Datasets':
             'db',
         ],
         help=(
-            'Upload one SQLite database. PostgreSQL migration support '
-            'will be connected in the next core.py update.'
+            'Upload one SQLite database. After registration, use the migration '
+            'button below to move it into PostgreSQL.'
         ),
     )
 
@@ -793,68 +798,892 @@ elif page == 'Datasets':
 
 elif page == 'Experiment':
     st.header('Controlled experiment')
-    st.caption('Run the same Full, Top-1, Top-3 and Top-5 pattern on one or both datasets.')
+    st.caption(
+        'Run the same benchmark questions through Full Schema, Top-1, '
+        'Top-3 and Top-5 using the real PostgreSQL schema and compare '
+        'execution accuracy, SQL validity, latency and token usage.'
+    )
+
     frame = cached_all()
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    dataset_choice = st.selectbox('Dataset scope', ['Both datasets'] + list(DATASETS))
-    count = st.number_input('Questions per selected scope', min_value=1, max_value=250, value=10)
-    provider = st.selectbox('SQL provider', ['OpenAI'])
-    st.caption('OpenAI API billing is separate from ChatGPT Plus. API errors are caught and recorded instead of crashing the app.')
-    run = st.button('Run experiment', use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+
+    if frame.empty:
+        st.info(
+            'No benchmark questions are available. Download BIRD or Spider first.'
+        )
+        st.stop()
+
+    st.markdown(
+        '<div class="card">',
+        unsafe_allow_html=True,
+    )
+
+    dataset_choice = st.selectbox(
+        'Dataset scope',
+        [
+            'Both datasets',
+            'BIRD Mini-Dev',
+            'Spider',
+        ],
+    )
+
+    count = st.number_input(
+        'Questions per selected dataset',
+        min_value=1,
+        max_value=250,
+        value=5,
+        step=1,
+    )
+
+    provider = st.selectbox(
+        'SQL provider',
+        ['OpenAI'],
+    )
+
+    st.caption(
+        'Each benchmark question is evaluated under four schema strategies. '
+        'Start with 3–5 questions to validate the pipeline before running a '
+        'larger experiment.'
+    )
+
+    run = st.button(
+        'Run experiment',
+        use_container_width=True,
+    )
+
+    st.markdown(
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
     if run:
-        selected = frame if dataset_choice == 'Both datasets' else frame[frame['dataset'] == dataset_choice]
         if dataset_choice == 'Both datasets':
-            selected = selected.groupby('dataset', group_keys=False).head(int(count))
+            selected = (
+                frame[
+                    frame['dataset'].isin(
+                        [
+                            'BIRD Mini-Dev',
+                            'Spider',
+                        ]
+                    )
+                ]
+                .groupby(
+                    'dataset',
+                    group_keys=False,
+                )
+                .head(
+                    int(count)
+                )
+            )
         else:
-            selected = selected.head(int(count))
-        progress = st.progress(0)
-        note = st.empty()
-        def update(current, total, message):
-            progress.progress(current / total)
-            note.caption(message)
-        with st.spinner('Running controlled comparison...'):
-            try:
-                output = run_experiment(selected, len(selected), provider, update)
-                st.session_state['experiment_summary'] = output['summary']
-                st.success('Experiment finished. Results were saved.')
-                st.dataframe(output['summary'].round(4), use_container_width=True, hide_index=True)
-            except Exception as exc:
-                st.error(str(exc))
+            selected = (
+                frame[
+                    frame['dataset']
+                    == dataset_choice
+                ]
+                .head(
+                    int(count)
+                )
+            )
+
+        if selected.empty:
+            st.error(
+                'No benchmark rows were found for the selected dataset.'
+            )
+        else:
+            progress = st.progress(0)
+            note = st.empty()
+
+            def update(
+                current,
+                total,
+                message,
+            ):
+                progress.progress(
+                    min(
+                        current / total,
+                        1.0,
+                    )
+                )
+                note.caption(
+                    message
+                )
+
+            with st.spinner(
+                'Running real PostgreSQL Text-to-SQL comparison...'
+            ):
+                try:
+                    output = run_experiment(
+                        selected,
+                        len(selected),
+                        provider,
+                        update,
+                    )
+
+                    st.session_state[
+                        'experiment_summary'
+                    ] = output[
+                        'summary'
+                    ]
+
+                    st.session_state[
+                        'experiment_overall'
+                    ] = output.get(
+                        'overall'
+                    )
+
+                    st.success(
+                        'Experiment finished successfully. Results were saved.'
+                    )
+
+                    st.subheader(
+                        'Dataset and strategy summary'
+                    )
+
+                    st.dataframe(
+                        output[
+                            'summary'
+                        ].round(4),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    overall = output.get(
+                        'overall'
+                    )
+
+                    if (
+                        overall is not None
+                        and not overall.empty
+                    ):
+                        st.subheader(
+                            'Overall strategy comparison'
+                        )
+
+                        st.dataframe(
+                            overall.round(4),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                    best = output.get(
+                        'best_strategy',
+                        {},
+                    )
+
+                    if best:
+                        accuracy = float(
+                            best.get(
+                                'execution_accuracy_percent',
+                                0,
+                            )
+                        )
+
+                        st.success(
+                            f"Best current dataset/strategy combination: "
+                            f"{best.get('dataset', '')} · "
+                            f"{best.get('strategy', '')} · "
+                            f"Execution accuracy {accuracy:.2f}%"
+                        )
+
+                except Exception as exc:
+                    st.error(
+                        f'Experiment failed: {exc}'
+                    )
+
 
 elif page == 'Comparison':
-    st.header('Dataset comparison')
+    st.header('Experiment comparison')
+    st.caption(
+        'Analyse execution accuracy and efficiency across BIRD, Spider, '
+        'Full Schema and relevant-schema retrieval strategies.'
+    )
+
     results = get_results()
+
     if results.empty:
-        st.info('Run an experiment first. This page will compare BIRD and Spider using the same strategies.')
+        st.info(
+            'Run an experiment first. The Comparison page uses the saved '
+            'experiment_results.csv file.'
+        )
+
     else:
-        summary_path = config.OUTPUT_DIR / 'dataset_strategy_summary.csv'
-        summary = pd.read_csv(summary_path) if summary_path.exists() else pd.DataFrame()
+        # ----------------------------------------------------
+        # Dataset / strategy summary
+        # ----------------------------------------------------
+
+        summary_path = (
+            config.OUTPUT_DIR
+            / 'dataset_strategy_summary.csv'
+        )
+
+        summary = (
+            pd.read_csv(
+                summary_path
+            )
+            if summary_path.exists()
+            else pd.DataFrame()
+        )
+
         if not summary.empty:
-            st.dataframe(summary.round(4), use_container_width=True, hide_index=True)
-        test = dataset_comparison_test(results)
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('### Statistical comparison')
-        if test.get('status') == 'ok':
-            a,b,c = st.columns(3)
-            a.metric('Test', test['test'])
-            b.metric('p-value', f"{test['p_value']:.4f}")
-            c.metric('Significant', 'Yes' if test['p_value'] < .05 else 'No')
+            st.subheader(
+                'Dataset and strategy performance'
+            )
+
+            preferred_columns = [
+                'dataset',
+                'strategy',
+                'questions',
+                'execution_accuracy_percent',
+                'sql_execution_percent',
+                'exact_match_percent',
+                'prompt_tokens',
+                'generation_latency',
+                'execution_time',
+                'schema_tables',
+                'repair_rate',
+            ]
+
+            available_columns = [
+                column
+                for column in preferred_columns
+                if column in summary.columns
+            ]
+
+            st.dataframe(
+                summary[
+                    available_columns
+                ].round(4),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # ----------------------------------------------------
+        # Key metrics
+        # ----------------------------------------------------
+
+        st.subheader(
+            'Key research metrics'
+        )
+
+        metric_source = (
+            summary
+            if not summary.empty
+            else results
+        )
+
+        accuracy_column = (
+            'execution_accuracy'
+            if 'execution_accuracy'
+            in metric_source.columns
+            else 'exact_match'
+            if 'exact_match'
+            in metric_source.columns
+            else None
+        )
+
+        if accuracy_column:
+            if not summary.empty:
+                best_row = summary.sort_values(
+                    accuracy_column,
+                    ascending=False,
+                ).iloc[0]
+
+                best_accuracy = float(
+                    best_row[
+                        accuracy_column
+                    ]
+                ) * 100
+            else:
+                best_row = None
+                best_accuracy = float(
+                    metric_source[
+                        accuracy_column
+                    ].mean()
+                ) * 100
         else:
-            st.info(test.get('message'))
-        st.markdown('</div>', unsafe_allow_html=True)
-        csv = results.to_csv(index=False).encode('utf-8')
-        st.download_button('Download experiment results', csv, 'experiment_results.csv', 'text/csv')
+            best_row = None
+            best_accuracy = float('nan')
+
+        full_rows = results[
+            results[
+                'strategy'
+            ] == 'Full schema'
+        ]
+
+        top5_rows = results[
+            results[
+                'strategy'
+            ] == 'Top-5'
+        ]
+
+        if (
+            'execution_accuracy'
+            in results.columns
+        ):
+            full_accuracy = (
+                full_rows[
+                    'execution_accuracy'
+                ].mean()
+                * 100
+                if not full_rows.empty
+                else float('nan')
+            )
+
+            top5_accuracy = (
+                top5_rows[
+                    'execution_accuracy'
+                ].mean()
+                * 100
+                if not top5_rows.empty
+                else float('nan')
+            )
+        else:
+            full_accuracy = float('nan')
+            top5_accuracy = float('nan')
+
+        if (
+            'prompt_tokens'
+            in results.columns
+            and not full_rows.empty
+            and not top5_rows.empty
+        ):
+            full_tokens = (
+                full_rows[
+                    'prompt_tokens'
+                ].mean()
+            )
+
+            top5_tokens = (
+                top5_rows[
+                    'prompt_tokens'
+                ].mean()
+            )
+
+            token_reduction = (
+                (
+                    full_tokens
+                    - top5_tokens
+                )
+                / full_tokens
+                * 100
+                if full_tokens
+                else float('nan')
+            )
+        else:
+            token_reduction = float('nan')
+
+        m1, m2, m3, m4 = st.columns(4)
+
+        m1.metric(
+            'Full Schema accuracy',
+            (
+                f'{full_accuracy:.2f}%'
+                if pd.notna(
+                    full_accuracy
+                )
+                else 'N/A'
+            ),
+        )
+
+        m2.metric(
+            'Top-5 accuracy',
+            (
+                f'{top5_accuracy:.2f}%'
+                if pd.notna(
+                    top5_accuracy
+                )
+                else 'N/A'
+            ),
+        )
+
+        m3.metric(
+            'Top-5 accuracy change',
+            (
+                f'{top5_accuracy - full_accuracy:+.2f} pp'
+                if (
+                    pd.notna(
+                        top5_accuracy
+                    )
+                    and pd.notna(
+                        full_accuracy
+                    )
+                )
+                else 'N/A'
+            ),
+        )
+
+        m4.metric(
+            'Top-5 token reduction',
+            (
+                f'{token_reduction:.2f}%'
+                if pd.notna(
+                    token_reduction
+                )
+                else 'N/A'
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Strategy accuracy table
+        # ----------------------------------------------------
+
+        if (
+            'execution_accuracy'
+            in results.columns
+        ):
+            st.subheader(
+                'Execution accuracy by strategy'
+            )
+
+            strategy_accuracy = (
+                results
+                .groupby(
+                    'strategy',
+                    as_index=False,
+                )
+                .agg(
+                    execution_accuracy=(
+                        'execution_accuracy',
+                        'mean',
+                    ),
+                    sql_execution_rate=(
+                        'success',
+                        'mean',
+                    ),
+                    prompt_tokens=(
+                        'prompt_tokens',
+                        'mean',
+                    ),
+                    generation_latency=(
+                        'generation_latency',
+                        'mean',
+                    ),
+                )
+            )
+
+            strategy_accuracy[
+                'execution_accuracy_percent'
+            ] = (
+                strategy_accuracy[
+                    'execution_accuracy'
+                ]
+                * 100
+            )
+
+            strategy_accuracy[
+                'sql_execution_percent'
+            ] = (
+                strategy_accuracy[
+                    'sql_execution_rate'
+                ]
+                * 100
+            )
+
+            st.dataframe(
+                strategy_accuracy[
+                    [
+                        'strategy',
+                        'execution_accuracy_percent',
+                        'sql_execution_percent',
+                        'prompt_tokens',
+                        'generation_latency',
+                    ]
+                ].round(4),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # ----------------------------------------------------
+        # Full vs Top-K paired significance tests
+        # ----------------------------------------------------
+
+        st.subheader(
+            'Full Schema vs relevant-schema significance tests'
+        )
+
+        try:
+            strategy_tests = (
+                all_strategy_tests(
+                    results
+                )
+            )
+
+            if strategy_tests.empty:
+                st.info(
+                    'Not enough paired observations are available yet.'
+                )
+
+            else:
+                display_test_columns = [
+                    column
+                    for column in [
+                        'baseline',
+                        'comparison',
+                        'paired_questions',
+                        'baseline_accuracy_percent',
+                        'comparison_accuracy_percent',
+                        'absolute_improvement_percent',
+                        'improved_questions',
+                        'worsened_questions',
+                        'unchanged_questions',
+                        'statistic',
+                        'p_value',
+                        'significant',
+                    ]
+                    if column
+                    in strategy_tests.columns
+                ]
+
+                st.dataframe(
+                    strategy_tests[
+                        display_test_columns
+                    ].round(4),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                top5_test = (
+                    strategy_tests[
+                        strategy_tests[
+                            'comparison'
+                        ]
+                        == 'Top-5'
+                    ]
+                )
+
+                if (
+                    not top5_test.empty
+                    and 'p_value'
+                    in top5_test.columns
+                ):
+                    row = (
+                        top5_test.iloc[0]
+                    )
+
+                    a, b, c = st.columns(3)
+
+                    a.metric(
+                        'Full vs Top-5 p-value',
+                        f"{float(row['p_value']):.4f}",
+                    )
+
+                    b.metric(
+                        'Statistically significant',
+                        (
+                            'Yes'
+                            if bool(
+                                row[
+                                    'significant'
+                                ]
+                            )
+                            else 'No'
+                        ),
+                    )
+
+                    c.metric(
+                        'Accuracy difference',
+                        (
+                            f"{float(row['absolute_improvement_percent']):+.2f} pp"
+                        ),
+                    )
+
+        except Exception as exc:
+            st.warning(
+                f'Strategy significance analysis could not be calculated: {exc}'
+            )
+
+        # ----------------------------------------------------
+        # Efficiency tests
+        # ----------------------------------------------------
+
+        st.subheader(
+            'Full Schema vs Top-5 efficiency'
+        )
+
+        efficiency_rows = []
+
+        for metric, label in [
+            (
+                'prompt_tokens',
+                'Prompt tokens',
+            ),
+            (
+                'generation_latency',
+                'Generation latency',
+            ),
+            (
+                'schema_tables',
+                'Schema tables supplied',
+            ),
+        ]:
+            if metric not in results.columns:
+                continue
+
+            try:
+                efficiency = (
+                    strategy_efficiency_test(
+                        results=results,
+                        metric=metric,
+                        baseline='Full schema',
+                        comparison='Top-5',
+                    )
+                )
+
+                if (
+                    efficiency.get(
+                        'status'
+                    )
+                    == 'ok'
+                ):
+                    efficiency_rows.append(
+                        {
+                            'metric': label,
+                            'full_schema_mean': (
+                                efficiency[
+                                    'baseline_mean'
+                                ]
+                            ),
+                            'top_5_mean': (
+                                efficiency[
+                                    'comparison_mean'
+                                ]
+                            ),
+                            'absolute_change': (
+                                efficiency[
+                                    'absolute_change'
+                                ]
+                            ),
+                            'relative_change_percent': (
+                                efficiency.get(
+                                    'relative_change_percent'
+                                )
+                            ),
+                            'p_value': (
+                                efficiency[
+                                    'p_value'
+                                ]
+                            ),
+                            'significant': (
+                                efficiency[
+                                    'significant'
+                                ]
+                            ),
+                        }
+                    )
+
+            except Exception:
+                continue
+
+        if efficiency_rows:
+            st.dataframe(
+                pd.DataFrame(
+                    efficiency_rows
+                ).round(4),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info(
+                'Efficiency comparisons are not available yet.'
+            )
+
+        # ----------------------------------------------------
+        # BIRD vs Spider comparison
+        # ----------------------------------------------------
+
+        st.subheader(
+            'BIRD vs Spider'
+        )
+
+        try:
+            dataset_test = (
+                dataset_comparison_test(
+                    results
+                )
+            )
+
+            if (
+                dataset_test.get(
+                    'status'
+                )
+                == 'ok'
+            ):
+                a, b, c = st.columns(3)
+
+                a.metric(
+                    'Test',
+                    dataset_test[
+                        'test'
+                    ],
+                )
+
+                b.metric(
+                    'p-value',
+                    f"{dataset_test['p_value']:.4f}",
+                )
+
+                c.metric(
+                    'Significant',
+                    (
+                        'Yes'
+                        if dataset_test.get(
+                            'significant',
+                            dataset_test[
+                                'p_value'
+                            ]
+                            < 0.05,
+                        )
+                        else 'No'
+                    ),
+                )
+
+                rates = (
+                    dataset_test.get(
+                        'dataset_accuracy_percent',
+                        {},
+                    )
+                )
+
+                if rates:
+                    rate_frame = pd.DataFrame(
+                        [
+                            {
+                                'dataset': key,
+                                'execution_accuracy_percent': value,
+                            }
+                            for key, value
+                            in rates.items()
+                        ]
+                    )
+
+                    st.dataframe(
+                        rate_frame,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                interpretation = (
+                    dataset_test.get(
+                        'interpretation'
+                    )
+                )
+
+                if interpretation:
+                    st.info(
+                        interpretation
+                    )
+
+            else:
+                st.info(
+                    dataset_test.get(
+                        'message',
+                        'Two datasets with both outcome classes are required.',
+                    )
+                )
+
+        except Exception as exc:
+            st.warning(
+                f'Dataset comparison could not be calculated: {exc}'
+            )
+
+        # ----------------------------------------------------
+        # Complete analysis expander
+        # ----------------------------------------------------
+
+        with st.expander(
+            'Complete statistical analysis'
+        ):
+            try:
+                analysis = (
+                    complete_statistical_analysis(
+                        results
+                    )
+                )
+
+                st.write(
+                    'Dataset comparison'
+                )
+                st.json(
+                    analysis.get(
+                        'dataset_comparison',
+                        {},
+                    )
+                )
+
+                strategy_frame = (
+                    analysis.get(
+                        'strategy_comparisons'
+                    )
+                )
+
+                if (
+                    isinstance(
+                        strategy_frame,
+                        pd.DataFrame,
+                    )
+                    and not strategy_frame.empty
+                ):
+                    st.write(
+                        'Strategy comparisons'
+                    )
+                    st.dataframe(
+                        strategy_frame.round(4),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                st.write(
+                    'Efficiency comparisons'
+                )
+                st.json(
+                    analysis.get(
+                        'efficiency_comparisons',
+                        {},
+                    )
+                )
+
+            except Exception as exc:
+                st.warning(
+                    str(exc)
+                )
+
+        # ----------------------------------------------------
+        # Download results
+        # ----------------------------------------------------
+
+        csv = (
+            results
+            .to_csv(
+                index=False
+            )
+            .encode(
+                'utf-8'
+            )
+        )
+
+        st.download_button(
+            'Download experiment results',
+            csv,
+            'experiment_results.csv',
+            'text/csv',
+        )
+
 
 elif page == 'ML prediction':
     st.header('ML prediction')
-    st.caption('Three machine-learning classifiers predict whether a generated SQL query will exactly match the benchmark SQL.')
+    st.caption('Three machine-learning classifiers model benchmark SQL outcome patterns using grouped train/test evaluation to reduce question leakage.')
     results = get_results()
     if results.empty:
         st.info('Run enough experiments first. At least 30 completed rows containing both outcome classes are required.')
     else:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.write('Models: Logistic Regression, Random Forest and Gradient Boosting.')
+        st.caption(
+            'The grouped split keeps the same natural-language question out of both '
+            'training and testing sets. Cross-validation and the overfitting gap are '
+            'reported so a score of 1.0 can be interpreted correctly rather than assumed '
+            'to mean perfect generalisation.'
+        )
         if st.button('Train and compare models', use_container_width=True):
             with st.spinner('Training models...'):
                 try:
