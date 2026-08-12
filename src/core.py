@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -79,16 +80,28 @@ def safe_identifier(name: str) -> str:
 
 
 def normalise_dataset(dataset: str | None) -> str:
-    """Validate and return a supported dataset name."""
+    """
+    Return a safe dataset key.
 
-    value = str(dataset or "bird").strip().lower()
+    Built-in datasets use:
+        bird
+        spider
 
-    if value not in {"bird", "spider"}:
-        raise ValueError(
-            f"Unsupported dataset '{dataset}'. Use 'bird' or 'spider'."
-        )
+    Uploaded datasets are also supported and are converted into safe
+    PostgreSQL-style identifiers.
+    """
 
-    return value
+    raw = str(dataset or "bird").strip()
+
+    if not raw:
+        return "bird"
+
+    lowered = raw.lower()
+
+    if lowered in {"bird", "spider"}:
+        return lowered
+
+    return safe_identifier(raw)
 
 
 def split_dataset_and_db_id(
@@ -96,13 +109,9 @@ def split_dataset_and_db_id(
     db_id: str,
 ) -> tuple[str, str]:
     """
-    Resolve the dataset and clean database ID.
+    Resolve dataset key and database ID.
 
-    Supported inputs:
-        dataset='bird', db_id='financial'
-        dataset='bird', db_id='bird_financial'
-        dataset=None, db_id='bird_financial'
-        dataset=None, db_id='spider_concert_singer'
+    Supports built-in datasets and uploaded datasets.
     """
 
     raw_db_id = str(db_id or "").strip()
@@ -119,7 +128,8 @@ def split_dataset_and_db_id(
         if lowered.startswith("spider_"):
             return "spider", raw_db_id[7:]
 
-        # Backward-compatible default for the original BIRD-only project.
+        # Generic uploaded schema format:
+        # <dataset_key>_<db_id>
         return "bird", raw_db_id
 
     dataset_key = normalise_dataset(dataset)
@@ -135,14 +145,27 @@ def postgres_schema_name(
     dataset: str | None,
     db_id: str,
 ) -> str:
-    """Return the migrated PostgreSQL schema name."""
+    """
+    Return the migrated PostgreSQL schema name.
+
+    Built-in examples:
+        bird_financial
+        spider_concert_singer
+
+    Uploaded example:
+        my_healthcare_patients
+    """
 
     dataset_key, clean_db_id = split_dataset_and_db_id(
         dataset,
         db_id,
     )
 
-    if hasattr(config, "postgres_schema_name"):
+    # Preserve the existing config helper for the two built-in datasets.
+    if (
+        dataset_key in {"bird", "spider"}
+        and hasattr(config, "postgres_schema_name")
+    ):
         return config.postgres_schema_name(
             dataset_key,
             clean_db_id,
@@ -150,6 +173,195 @@ def postgres_schema_name(
 
     return safe_identifier(
         f"{dataset_key}_{clean_db_id}"
+    )
+
+
+def quote_schema_identifier(name: str) -> str:
+    """Safely quote a PostgreSQL schema identifier."""
+
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def sqlite_table_names(
+    sqlite_path: str | Path,
+) -> list[str]:
+    """Return user tables from an SQLite database."""
+
+    path = Path(sqlite_path)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"SQLite database not found: {path}"
+        )
+
+    connection = sqlite3.connect(
+        str(path)
+    )
+
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+            """
+        )
+
+        return [
+            str(row[0])
+            for row in cursor.fetchall()
+        ]
+
+    finally:
+        connection.close()
+
+
+def migrate_uploaded_sqlite_to_postgres(
+    dataset: str,
+    sqlite_path: str | Path,
+    db_id: str | None = None,
+    replace: bool = True,
+) -> dict[str, Any]:
+    """
+    Migrate one uploaded SQLite database into Render PostgreSQL.
+
+    Each uploaded database is stored in its own PostgreSQL schema.
+
+    Example:
+        dataset='My Healthcare Dataset'
+        db_id='patients'
+
+        -> schema: my_healthcare_dataset_patients
+    """
+
+    dataset_key = normalise_dataset(
+        dataset
+    )
+
+    path = Path(
+        sqlite_path
+    )
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"SQLite database does not exist: {path}"
+        )
+
+    clean_db_id = safe_identifier(
+        db_id
+        or path.stem
+        or "database"
+    )
+
+    schema = postgres_schema_name(
+        dataset_key,
+        clean_db_id,
+    )
+
+    tables = sqlite_table_names(
+        path
+    )
+
+    if not tables:
+        raise ValueError(
+            "No user tables were found in the SQLite database."
+        )
+
+    escaped_schema = quote_schema_identifier(
+        schema
+    )
+
+    with engine.begin() as connection:
+        if replace:
+            connection.execute(
+                text(
+                    f"DROP SCHEMA IF EXISTS "
+                    f"{escaped_schema} CASCADE"
+                )
+            )
+
+        connection.execute(
+            text(
+                f"CREATE SCHEMA IF NOT EXISTS "
+                f"{escaped_schema}"
+            )
+        )
+
+    sqlite_connection = sqlite3.connect(
+        str(path)
+    )
+
+    migrated_tables: list[dict[str, Any]] = []
+
+    try:
+        for table_name in tables:
+            escaped_sqlite_table = (
+                str(table_name)
+                .replace('"', '""')
+            )
+
+            frame = pd.read_sql_query(
+                f'SELECT * FROM "{escaped_sqlite_table}"',
+                sqlite_connection,
+            )
+
+            frame.to_sql(
+                name=str(table_name),
+                con=engine,
+                schema=schema,
+                if_exists=(
+                    "replace"
+                    if replace
+                    else "append"
+                ),
+                index=False,
+                method="multi",
+                chunksize=1000,
+            )
+
+            migrated_tables.append(
+                {
+                    "table": str(table_name),
+                    "rows": int(len(frame)),
+                    "columns": int(
+                        len(frame.columns)
+                    ),
+                }
+            )
+
+    finally:
+        sqlite_connection.close()
+
+    retriever.clear()
+
+    return {
+        "dataset": dataset_key,
+        "db_id": clean_db_id,
+        "schema": schema,
+        "tables": migrated_tables,
+        "table_count": len(
+            migrated_tables
+        ),
+        "row_count": int(
+            sum(
+                item["rows"]
+                for item in migrated_tables
+            )
+        ),
+    }
+
+
+def list_uploaded_postgres_databases(
+    dataset: str,
+) -> list[str]:
+    """List PostgreSQL databases for an uploaded dataset."""
+
+    return list_databases(
+        normalise_dataset(dataset)
     )
 
 
@@ -678,6 +890,126 @@ STRICT RULES
     )
 
 
+def repair_sql(
+    question: str,
+    schema_context: str,
+    failed_sql: str,
+    error_message: str,
+    evidence: str | None = None,
+) -> tuple[str, float, int, int]:
+    """
+    Ask the LLM to repair a failed PostgreSQL query.
+
+    Gold SQL is never supplied to the repair prompt.
+    """
+
+    evidence_text = str(
+        evidence or ""
+    ).strip()
+
+    evidence_section = (
+        f"""
+BENCHMARK EVIDENCE / HINT
+-------------------------
+{evidence_text}
+"""
+        if evidence_text
+        else ""
+    )
+
+    prompt = f"""
+You are repairing a PostgreSQL Text-to-SQL query.
+
+DATABASE SCHEMA
+---------------
+{schema_context}
+
+USER QUESTION
+-------------
+{question}
+
+{evidence_section}
+
+FAILED SQL
+----------
+{failed_sql}
+
+POSTGRESQL ERROR
+----------------
+{error_message}
+
+REPAIR RULES
+------------
+1. Return exactly one corrected PostgreSQL SELECT query.
+2. Use only tables and columns shown in DATABASE SCHEMA.
+3. Preserve quoted PostgreSQL identifiers exactly.
+4. Do not invent tables, columns, relationships or coded values.
+5. Fix the actual PostgreSQL error while preserving the user's intended meaning.
+6. WITH is allowed only when the final statement is SELECT.
+7. Return SQL only.
+8. Do not include markdown, comments or explanations.
+""".strip()
+
+    started_at = time.perf_counter()
+
+    if not OPENAI_API_KEY:
+        return (
+            failed_sql,
+            time.perf_counter() - started_at,
+            count_tokens(prompt),
+            count_tokens(failed_sql),
+        )
+
+    client = OpenAI(
+        api_key=OPENAI_API_KEY
+    )
+
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Repair the failed read-only PostgreSQL query. "
+                    "Return only one corrected SELECT query."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    )
+
+    repaired = clean_sql(
+        response.choices[0].message.content
+        or ""
+    )
+
+    usage = response.usage
+
+    prompt_tokens = (
+        int(usage.prompt_tokens)
+        if usage is not None
+        else count_tokens(prompt)
+    )
+
+    completion_tokens = (
+        int(usage.completion_tokens)
+        if usage is not None
+        else count_tokens(repaired)
+    )
+
+    return (
+        repaired,
+        time.perf_counter()
+        - started_at,
+        prompt_tokens,
+        completion_tokens,
+    )
+
+
 # ============================================================
 # SQL validation and execution
 # ============================================================
@@ -1086,8 +1418,12 @@ def run_strategy(
     gold_sql: str | None = None,
     dataset: str | None = None,
     evidence: str | None = None,
+    max_repair_attempts: int = 1,
 ) -> dict[str, Any]:
-    """Run retrieval, generation, execution and evaluation."""
+    """
+    Run schema retrieval, SQL generation, PostgreSQL execution,
+    optional automatic repair, and benchmark evaluation.
+    """
 
     dataset_key, clean_db_id = split_dataset_and_db_id(
         dataset,
@@ -1103,6 +1439,12 @@ def run_strategy(
         )
     )
 
+    if not schema_context.strip():
+        raise ValueError(
+            "No PostgreSQL schema metadata was found for "
+            f"{dataset_key}/{clean_db_id}."
+        )
+
     (
         generated_sql,
         generation_latency,
@@ -1115,9 +1457,20 @@ def run_strategy(
         evidence=evidence,
     )
 
-    valid, validation_error = validate_sql(
+    original_generated_sql = (
         generated_sql
     )
+
+    valid, validation_error = (
+        validate_sql(
+            generated_sql
+        )
+    )
+
+    repair_attempts = 0
+    repair_history: list[
+        dict[str, Any]
+    ] = []
 
     if valid:
         (
@@ -1135,15 +1488,170 @@ def run_strategy(
         success = False
         columns = []
         rows = []
-        execution_error = validation_error
+        execution_error = (
+            validation_error
+        )
         execution_time = 0.0
+
+    total_generation_latency = (
+        generation_latency
+    )
+
+    total_prompt_tokens = (
+        prompt_tokens
+    )
+
+    total_completion_tokens = (
+        completion_tokens
+    )
+
+    while (
+        not success
+        and repair_attempts
+        < max(
+            int(max_repair_attempts),
+            0,
+        )
+        and OPENAI_API_KEY
+    ):
+        repair_attempts += 1
+
+        failed_sql = generated_sql
+
+        (
+            repaired_sql,
+            repair_latency,
+            repair_prompt_tokens,
+            repair_completion_tokens,
+        ) = repair_sql(
+            question=question,
+            schema_context=schema_context,
+            failed_sql=failed_sql,
+            error_message=(
+                execution_error
+                or validation_error
+                or "Unknown PostgreSQL error."
+            ),
+            evidence=evidence,
+        )
+
+        total_generation_latency += (
+            repair_latency
+        )
+
+        total_prompt_tokens += (
+            repair_prompt_tokens
+        )
+
+        total_completion_tokens += (
+            repair_completion_tokens
+        )
+
+        repaired_valid, repaired_error = (
+            validate_sql(
+                repaired_sql
+            )
+        )
+
+        if repaired_valid:
+            (
+                repaired_success,
+                repaired_columns,
+                repaired_rows,
+                repaired_execution_error,
+                repaired_execution_time,
+            ) = execute_sql(
+                sql_query=repaired_sql,
+                db_id=clean_db_id,
+                dataset=dataset_key,
+            )
+        else:
+            repaired_success = False
+            repaired_columns = []
+            repaired_rows = []
+            repaired_execution_error = (
+                repaired_error
+            )
+            repaired_execution_time = 0.0
+
+        repair_history.append(
+            {
+                "attempt": (
+                    repair_attempts
+                ),
+                "failed_sql": (
+                    failed_sql
+                ),
+                "error": (
+                    execution_error
+                    or validation_error
+                ),
+                "repaired_sql": (
+                    repaired_sql
+                ),
+                "success": int(
+                    repaired_success
+                ),
+            }
+        )
+
+        generated_sql = (
+            repaired_sql
+        )
+
+        success = (
+            repaired_success
+        )
+
+        columns = (
+            repaired_columns
+        )
+
+        rows = (
+            repaired_rows
+        )
+
+        execution_error = (
+            repaired_execution_error
+        )
+
+        execution_time += (
+            repaired_execution_time
+        )
+
+        validation_error = (
+            repaired_error
+        )
 
     exact_match = (
         None
         if not gold_sql
         else int(
-            normalise_sql(generated_sql)
-            == normalise_sql(gold_sql)
+            normalise_sql(
+                generated_sql
+            )
+            == normalise_sql(
+                gold_sql
+            )
+        )
+    )
+
+    prepared_gold_sql = (
+        prepare_gold_sql_for_postgres(
+            gold_sql=gold_sql,
+            db_id=clean_db_id,
+            dataset=dataset_key,
+        )
+        if gold_sql
+        else None
+    )
+
+    execution_match = (
+        execution_accuracy(
+            predicted_sql=generated_sql,
+            gold_sql=gold_sql,
+            db_id=clean_db_id,
+            dataset=dataset_key,
         )
     )
 
@@ -1151,41 +1659,96 @@ def run_strategy(
         "dataset": dataset_key,
         "strategy": strategy,
         "db_id": clean_db_id,
-        "postgres_schema": postgres_schema_name(
-            dataset_key,
-            clean_db_id,
+        "postgres_schema": (
+            postgres_schema_name(
+                dataset_key,
+                clean_db_id,
+            )
         ),
         "question": question,
-        "evidence": evidence or "",
-        "schema_context": schema_context,
-        "retrieved_tables": retrieved_tables,
-        "generated_sql": generated_sql,
-        "success": int(success),
+        "evidence": (
+            evidence or ""
+        ),
+        "schema_context": (
+            schema_context
+        ),
+        "retrieved_tables": (
+            retrieved_tables
+        ),
+        "original_generated_sql": (
+            original_generated_sql
+        ),
+        "generated_sql": (
+            generated_sql
+        ),
+        "success": int(
+            success
+        ),
         "columns": columns,
-        "rows": rows[:MAX_RESULT_ROWS],
-        "error": execution_error,
-        "generation_latency": generation_latency,
-        "execution_time": execution_time,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "exact_match": exact_match,
+        "rows": (
+            rows[:MAX_RESULT_ROWS]
+        ),
+        "error": (
+            execution_error
+        ),
+        "generation_latency": (
+            total_generation_latency
+        ),
+        "execution_time": (
+            execution_time
+        ),
+        "prompt_tokens": (
+            total_prompt_tokens
+        ),
+        "completion_tokens": (
+            total_completion_tokens
+        ),
+        "exact_match": (
+            exact_match
+        ),
         "prepared_gold_sql": (
-            prepare_gold_sql_for_postgres(
-                gold_sql=gold_sql,
-                db_id=clean_db_id,
-                dataset=dataset_key,
-            )
-            if gold_sql
-            else None
+            prepared_gold_sql
         ),
-        "execution_accuracy": execution_accuracy(
-            predicted_sql=generated_sql,
-            gold_sql=gold_sql,
-            db_id=clean_db_id,
-            dataset=dataset_key,
+        "execution_accuracy": (
+            execution_match
         ),
-        "demo_mode": demo_mode,
+        "repair_attempts": (
+            repair_attempts
+        ),
+        "repair_history": (
+            repair_history
+        ),
+        "demo_mode": (
+            demo_mode
+        ),
     }
+
+
+def run_custom_question(
+    question: str,
+    dataset: str,
+    db_id: str,
+    strategy: str = "top_5",
+    max_repair_attempts: int = 1,
+) -> dict[str, Any]:
+    """
+    Run a custom user question without claiming benchmark accuracy.
+
+    The result contains generated SQL, execution status and database rows.
+    execution_accuracy remains None because no gold SQL is provided.
+    """
+
+    return run_strategy(
+        question=question,
+        db_id=db_id,
+        strategy=strategy,
+        gold_sql=None,
+        dataset=dataset,
+        evidence=None,
+        max_repair_attempts=(
+            max_repair_attempts
+        ),
+    )
 
 
 # ============================================================
