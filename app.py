@@ -4,7 +4,18 @@ import pandas as pd
 import streamlit as st
 
 from src import config
-from src.datasets_manager import DATASETS, download_dataset, load_all, load_dataset_frame, dataset_summary
+from src.datasets_manager import (
+    DATASETS,
+    download_dataset,
+    load_all,
+    load_dataset_frame,
+    dataset_summary,
+    register_uploaded_dataset,
+    list_uploaded_datasets,
+    all_dataset_names,
+    inspect_sqlite_database,
+    get_uploaded_metadata,
+)
 from src.experiment import run_experiment
 from src.ml_models import train_models
 from src.statistics import dataset_comparison_test
@@ -73,11 +84,36 @@ if page == 'Ask':
         st.error('Datasets could not be loaded. Open the Datasets page and retry the download.')
         st.stop()
 
-    display_to_key = {'BIRD Mini-Dev': 'bird', 'Spider': 'spider'}
+    display_to_key = {
+        'BIRD Mini-Dev': 'bird',
+        'Spider': 'spider',
+    }
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 1.2, 1])
-    dataset_name = c1.selectbox('Dataset', list(DATASETS))
+
+    dataset_choices = all_dataset_names()
+    dataset_name = c1.selectbox('Dataset', dataset_choices)
+
+    if dataset_name not in display_to_key:
+        st.info(
+            'This uploaded dataset has been registered successfully. '
+            'PostgreSQL migration and Text-to-SQL execution support for uploaded '
+            'datasets will be enabled in the next core.py update.'
+        )
+
+        metadata = get_uploaded_metadata(dataset_name)
+
+        if metadata:
+            st.write({
+                'dataset': metadata.get('dataset_name'),
+                'description': metadata.get('description'),
+                'questions_file': metadata.get('questions_file'),
+                'sqlite_file': metadata.get('sqlite_file'),
+            })
+
+        st.stop()
+
     dataset_key = display_to_key[dataset_name]
 
     available_databases = list_databases(dataset_key)
@@ -218,37 +254,367 @@ if page == 'Ask':
 
 elif page == 'Datasets':
     st.header('Datasets')
-    st.caption('Both question datasets are downloaded automatically from Hugging Face and cached locally.')
+    st.caption(
+        'Use the built-in BIRD and Spider benchmarks or register your own '
+        'Text-to-SQL dataset for later PostgreSQL migration and querying.'
+    )
+
+    st.subheader('Built-in benchmarks')
+
     cols = st.columns(2)
+
     for col, name in zip(cols, DATASETS):
         with col:
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown(f'### {name}')
             st.write(DATASETS[name]['description'])
+
             try:
-                frame = load_dataset_frame(name, auto_download=False)
-                st.caption(f"{len(frame):,} cached questions" if not frame.empty else 'Not downloaded yet')
+                frame = load_dataset_frame(
+                    name,
+                    auto_download=False,
+                )
+
+                st.caption(
+                    f"{len(frame):,} cached questions"
+                    if not frame.empty
+                    else 'Not downloaded yet'
+                )
+
             except Exception:
                 st.caption('Not downloaded yet')
-            if st.button(f'Download / refresh {name}', key=f'dl_{name}', use_container_width=True):
-                with st.spinner(f'Downloading {name}...'):
+
+            if st.button(
+                f'Download / refresh {name}',
+                key=f'dl_{name}',
+                use_container_width=True,
+            ):
+                with st.spinner(
+                    f'Downloading {name}...'
+                ):
                     try:
-                        downloaded = download_dataset(name, force=True)
+                        downloaded = download_dataset(
+                            name,
+                            force=True,
+                        )
+
                         cached_all.clear()
-                        st.success(f'{len(downloaded):,} questions are ready.')
+
+                        st.success(
+                            f'{len(downloaded):,} questions are ready.'
+                        )
+
                     except Exception as exc:
-                        st.error(f'Download failed: {exc}')
-            st.markdown('</div>', unsafe_allow_html=True)
+                        st.error(
+                            f'Download failed: {exc}'
+                        )
+
+            st.markdown(
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+
+    st.subheader('Upload your own dataset')
+    st.caption(
+        'Register a dataset using a questions file and/or one SQLite database. '
+        'Question files can be CSV, JSON or JSONL. SQLite files can be '
+        '.sqlite, .sqlite3 or .db.'
+    )
+
+    st.markdown(
+        '<div class="card">',
+        unsafe_allow_html=True,
+    )
+
+    upload_name = st.text_input(
+        'Dataset name',
+        placeholder='Example: My Healthcare Database',
+    )
+
+    upload_description = st.text_area(
+        'Description',
+        height=80,
+        placeholder='Short description of the uploaded dataset.',
+    )
+
+    q_col, db_col = st.columns(2)
+
+    questions_upload = q_col.file_uploader(
+        'Questions file',
+        type=[
+            'csv',
+            'json',
+            'jsonl',
+        ],
+        help=(
+            'Recommended columns/fields: question, db_id, gold_sql or query. '
+            'Evidence and difficulty are optional.'
+        ),
+    )
+
+    sqlite_upload = db_col.file_uploader(
+        'SQLite database',
+        type=[
+            'sqlite',
+            'sqlite3',
+            'db',
+        ],
+        help=(
+            'Upload one SQLite database. PostgreSQL migration support '
+            'will be connected in the next core.py update.'
+        ),
+    )
+
+    if st.button(
+        'Register uploaded dataset',
+        use_container_width=True,
+    ):
+        if not upload_name.strip():
+            st.warning(
+                'Enter a dataset name.'
+            )
+
+        elif (
+            questions_upload is None
+            and sqlite_upload is None
+        ):
+            st.warning(
+                'Upload at least a questions file or an SQLite database.'
+            )
+
+        else:
+            try:
+                upload_temp_dir = (
+                    config.DATA_DIR
+                    / '_upload_temp'
+                )
+
+                upload_temp_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                questions_temp_path = None
+                sqlite_temp_path = None
+
+                if questions_upload is not None:
+                    questions_temp_path = (
+                        upload_temp_dir
+                        / questions_upload.name
+                    )
+
+                    questions_temp_path.write_bytes(
+                        questions_upload.getbuffer()
+                    )
+
+                if sqlite_upload is not None:
+                    sqlite_temp_path = (
+                        upload_temp_dir
+                        / sqlite_upload.name
+                    )
+
+                    sqlite_temp_path.write_bytes(
+                        sqlite_upload.getbuffer()
+                    )
+
+                metadata = register_uploaded_dataset(
+                    dataset_name=upload_name.strip(),
+                    questions_file=questions_temp_path,
+                    sqlite_file=sqlite_temp_path,
+                    description=upload_description.strip(),
+                )
+
+                cached_all.clear()
+
+                st.success(
+                    f"Dataset '{metadata['dataset_name']}' was registered successfully."
+                )
+
+                if questions_temp_path and questions_temp_path.exists():
+                    try:
+                        questions_temp_path.unlink()
+                    except Exception:
+                        pass
+
+                if sqlite_temp_path and sqlite_temp_path.exists():
+                    try:
+                        sqlite_temp_path.unlink()
+                    except Exception:
+                        pass
+
+            except Exception as exc:
+                st.error(
+                    f'Upload failed: {exc}'
+                )
+
+    st.markdown(
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    uploaded_names = list_uploaded_datasets()
+
+    if uploaded_names:
+        st.subheader('Registered uploaded datasets')
+
+        for uploaded_name in uploaded_names:
+            metadata = get_uploaded_metadata(
+                uploaded_name
+            )
+
+            st.markdown(
+                '<div class="card">',
+                unsafe_allow_html=True,
+            )
+
+            st.markdown(
+                f'### {uploaded_name}'
+            )
+
+            st.write(
+                metadata.get(
+                    'description',
+                    'User uploaded Text-to-SQL dataset.',
+                )
+            )
+
+            details = {
+                'Questions file': (
+                    metadata.get(
+                        'questions_file'
+                    )
+                    or 'Not provided'
+                ),
+                'SQLite file': (
+                    metadata.get(
+                        'sqlite_file'
+                    )
+                    or 'Not provided'
+                ),
+            }
+
+            st.json(details)
+
+            sqlite_path = metadata.get(
+                'sqlite_file'
+            )
+
+            if sqlite_path:
+                if st.button(
+                    f'Inspect schema: {uploaded_name}',
+                    key=f'inspect_{uploaded_name}',
+                ):
+                    try:
+                        schema = inspect_sqlite_database(
+                            sqlite_path
+                        )
+
+                        if not schema:
+                            st.info(
+                                'No user tables were found in the SQLite database.'
+                            )
+
+                        else:
+                            st.success(
+                                f'{len(schema)} tables found.'
+                            )
+
+                            for table_name, columns in schema.items():
+                                with st.expander(
+                                    table_name
+                                ):
+                                    st.dataframe(
+                                        pd.DataFrame(
+                                            columns
+                                        ),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+
+                    except Exception as exc:
+                        st.error(
+                            f'Schema inspection failed: {exc}'
+                        )
+
+            st.markdown(
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
     all_data = cached_all()
+
     if not all_data.empty:
-        st.subheader('Dataset overview')
-        st.dataframe(dataset_summary(all_data).round(2), use_container_width=True, hide_index=True)
-        dataset_filter = st.selectbox('Browse', ['Both datasets'] + list(DATASETS))
-        view = all_data if dataset_filter == 'Both datasets' else all_data[all_data['dataset'] == dataset_filter]
-        search = st.text_input('Search questions')
+        st.subheader(
+            'Dataset overview'
+        )
+
+        st.dataframe(
+            dataset_summary(
+                all_data
+            ).round(2),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        browse_options = [
+            'All datasets'
+        ] + all_dataset_names()
+
+        dataset_filter = st.selectbox(
+            'Browse',
+            browse_options,
+        )
+
+        if dataset_filter == 'All datasets':
+            view = all_data
+
+        else:
+            view = all_data[
+                all_data[
+                    'dataset'
+                ]
+                == dataset_filter
+            ]
+
+        search = st.text_input(
+            'Search questions'
+        )
+
         if search:
-            view = view[view['question'].str.contains(search, case=False, na=False)]
-        st.dataframe(view[['dataset','db_id','difficulty','question','gold_sql']].head(500), use_container_width=True, hide_index=True, height=470)
+            view = view[
+                view[
+                    'question'
+                ].str.contains(
+                    search,
+                    case=False,
+                    na=False,
+                )
+            ]
+
+        display_columns = [
+            column
+            for column in [
+                'dataset',
+                'db_id',
+                'difficulty',
+                'question',
+                'gold_sql',
+                'evidence',
+            ]
+            if column in view.columns
+        ]
+
+        st.dataframe(
+            view[
+                display_columns
+            ].head(500),
+            use_container_width=True,
+            hide_index=True,
+            height=470,
+        )
+
 
 elif page == 'Experiment':
     st.header('Controlled experiment')
