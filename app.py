@@ -15,12 +15,19 @@ from src.datasets_manager import (
     all_dataset_names,
     inspect_sqlite_database,
     get_uploaded_metadata,
+    uploaded_sqlite_path,
 )
 from src.experiment import run_experiment
 from src.ml_models import train_models
 from src.statistics import dataset_comparison_test
 from src import core
-from src.core import list_databases, run_strategy
+from src.core import (
+    list_databases,
+    run_strategy,
+    run_custom_question,
+    migrate_uploaded_sqlite_to_postgres,
+    normalise_dataset,
+)
 
 st.set_page_config(page_title='Text-to-SQL Lab', page_icon='☁️', layout='wide', initial_sidebar_state='collapsed')
 
@@ -95,30 +102,33 @@ if page == 'Ask':
     dataset_choices = all_dataset_names()
     dataset_name = c1.selectbox('Dataset', dataset_choices)
 
-    if dataset_name not in display_to_key:
-        st.info(
-            'This uploaded dataset has been registered successfully. '
-            'PostgreSQL migration and Text-to-SQL execution support for uploaded '
-            'datasets will be enabled in the next core.py update.'
-        )
+    is_uploaded_dataset = dataset_name not in display_to_key
 
-        metadata = get_uploaded_metadata(dataset_name)
-
-        if metadata:
-            st.write({
-                'dataset': metadata.get('dataset_name'),
-                'description': metadata.get('description'),
-                'questions_file': metadata.get('questions_file'),
-                'sqlite_file': metadata.get('sqlite_file'),
-            })
-
-        st.stop()
-
-    dataset_key = display_to_key[dataset_name]
+    if is_uploaded_dataset:
+        dataset_key = normalise_dataset(dataset_name)
+    else:
+        dataset_key = display_to_key[dataset_name]
 
     available_databases = list_databases(dataset_key)
+
     if not available_databases:
-        st.error(f'No migrated PostgreSQL schemas were found for {dataset_name}.')
+        if is_uploaded_dataset:
+            metadata = get_uploaded_metadata(dataset_name)
+
+            st.warning(
+                'This uploaded dataset has not been migrated to PostgreSQL yet.'
+            )
+
+            if metadata:
+                st.caption(
+                    'Open the Datasets page, migrate the uploaded SQLite database, '
+                    'then return here to ask questions.'
+                )
+        else:
+            st.error(
+                f'No migrated PostgreSQL schemas were found for {dataset_name}.'
+            )
+
         st.stop()
 
     subset = frame[frame['dataset'] == dataset_name].copy()
@@ -139,9 +149,16 @@ if page == 'Ask':
         'Top-3': 'top_3',
     }
 
+    mode_options = ['Enter my own question']
+
+    if not is_uploaded_dataset:
+        mode_options.append('Use benchmark question')
+    elif not subset.empty:
+        mode_options.append('Use benchmark question')
+
     mode = st.radio(
         'Question mode',
-        ['Enter my own question', 'Use benchmark question'],
+        mode_options,
         horizontal=True,
     )
 
@@ -150,35 +167,98 @@ if page == 'Ask':
     benchmark_record = None
 
     if mode == 'Use benchmark question':
-        examples = subset[subset['db_id'].astype(str) == str(db_id)].head(200)
-        if examples.empty:
-            st.warning('No benchmark questions were found for this migrated database. Use your own question instead.')
-            question = st.text_area('Question', height=110, placeholder='Example: Show the five customers with the highest total payments.')
-        else:
-            selected = st.selectbox('Benchmark question', examples['question'].tolist())
-            benchmark_record = examples[examples['question'] == selected].iloc[0]
-            question = st.text_area('Question', value=str(benchmark_record['question']), height=110)
-            gold_sql = str(benchmark_record.get('gold_sql', '') or '')
-            evidence = str(benchmark_record.get('evidence', '') or '').strip()
+        examples = subset[
+            subset['db_id'].astype(str) == str(db_id)
+        ].head(200)
 
-            st.caption('Ground-truth SQL is available, so the application can show Correct or Incorrect.')
+        if examples.empty:
+            st.warning(
+                'No benchmark questions were found for this migrated database. '
+                'Use your own question instead.'
+            )
+
+            question = st.text_area(
+                'Question',
+                height=110,
+                placeholder='Example: Show the five customers with the highest total payments.',
+            )
+
+        else:
+            selected = st.selectbox(
+                'Benchmark question',
+                examples['question'].tolist(),
+            )
+
+            benchmark_record = (
+                examples[
+                    examples['question'] == selected
+                ].iloc[0]
+            )
+
+            question = st.text_area(
+                'Question',
+                value=str(
+                    benchmark_record['question']
+                ),
+                height=110,
+            )
+
+            gold_sql = str(
+                benchmark_record.get(
+                    'gold_sql',
+                    '',
+                )
+                or ''
+            )
+
+            evidence = str(
+                benchmark_record.get(
+                    'evidence',
+                    '',
+                )
+                or ''
+            ).strip()
+
+            if gold_sql.strip():
+                st.caption(
+                    'Ground-truth SQL is available, so the application can '
+                    'show Correct or Incorrect.'
+                )
+            else:
+                st.caption(
+                    'This benchmark row does not contain verified SQL, so only '
+                    'execution success can be shown.'
+                )
 
             if evidence:
-                with st.expander('Benchmark evidence / hint'):
-                    st.write(evidence)
+                with st.expander(
+                    'Benchmark evidence / hint'
+                ):
+                    st.write(
+                        evidence
+                    )
+
     else:
         question = st.text_area(
             'Enter your natural-language question',
             height=110,
             placeholder='Example: Show the five customers with the highest total payments.',
         )
-        with st.expander('Optional: provide expected SQL to verify correctness'):
+
+        with st.expander(
+            'Optional: provide expected SQL to verify correctness'
+        ):
             gold_sql = st.text_area(
                 'Expected SQL',
                 height=120,
                 placeholder='Leave empty when the correct answer is not known.',
             )
-            st.caption('Without expected SQL, the application can show validity and execution success, but it cannot scientifically claim accuracy.')
+
+            st.caption(
+                'Without expected SQL, the application can show SQL validity, '
+                'execution success and database results, but it cannot claim '
+                '100% correctness.'
+            )
 
     generate = st.button('Generate and run SQL', use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
@@ -189,14 +269,28 @@ if page == 'Ask':
         else:
             with st.spinner('Retrieving schema, generating SQL and executing the query...'):
                 try:
-                    result = run_strategy(
-                        question=question.strip(),
-                        db_id=db_id,
-                        strategy=strategy_map[strategy_label],
-                        gold_sql=gold_sql.strip() or None,
-                        dataset=dataset_key,
-                        evidence=evidence or None,
-                    )
+                    if (
+                        mode == 'Enter my own question'
+                        and not gold_sql.strip()
+                    ):
+                        result = run_custom_question(
+                            question=question.strip(),
+                            dataset=dataset_key,
+                            db_id=db_id,
+                            strategy=strategy_map[strategy_label],
+                            max_repair_attempts=1,
+                        )
+                    else:
+                        result = run_strategy(
+                            question=question.strip(),
+                            db_id=db_id,
+                            strategy=strategy_map[strategy_label],
+                            gold_sql=gold_sql.strip() or None,
+                            dataset=dataset_key,
+                            evidence=evidence or None,
+                            max_repair_attempts=1,
+                        )
+
                     st.session_state['ask_result'] = result
                 except Exception as exc:
                     st.error(f'Generation failed: {exc}')
@@ -219,6 +313,19 @@ if page == 'Ask':
         if result.get('evidence'):
             with st.expander('Evidence supplied to the model'):
                 st.write(result['evidence'])
+
+        if result.get('repair_attempts', 0):
+            st.info(
+                f"Automatic SQL repair attempts: {result['repair_attempts']}"
+            )
+
+            with st.expander('SQL repair details'):
+                st.json(
+                    result.get(
+                        'repair_history',
+                        [],
+                    )
+                )
 
         if result['success']:
             st.success('The SQL is valid and executed successfully. Execution success does not by itself prove the answer is correct.')
@@ -502,9 +609,12 @@ elif page == 'Datasets':
             )
 
             if sqlite_path:
-                if st.button(
+                action_col1, action_col2 = st.columns(2)
+
+                if action_col1.button(
                     f'Inspect schema: {uploaded_name}',
                     key=f'inspect_{uploaded_name}',
+                    use_container_width=True,
                 ):
                     try:
                         schema = inspect_sqlite_database(
@@ -537,6 +647,71 @@ elif page == 'Datasets':
                         st.error(
                             f'Schema inspection failed: {exc}'
                         )
+
+                if action_col2.button(
+                    f'Migrate to PostgreSQL: {uploaded_name}',
+                    key=f'migrate_{uploaded_name}',
+                    use_container_width=True,
+                ):
+                    with st.spinner(
+                        'Migrating SQLite tables into PostgreSQL...'
+                    ):
+                        try:
+                            source_path = uploaded_sqlite_path(
+                                uploaded_name
+                            )
+
+                            if source_path is None:
+                                raise FileNotFoundError(
+                                    'Uploaded SQLite database is not available.'
+                                )
+
+                            migration = migrate_uploaded_sqlite_to_postgres(
+                                dataset=uploaded_name,
+                                sqlite_path=source_path,
+                                db_id=source_path.stem,
+                                replace=True,
+                            )
+
+                            core.retriever.clear()
+
+                            st.success(
+                                'Migration completed successfully.'
+                            )
+
+                            m1, m2, m3 = st.columns(3)
+
+                            m1.metric(
+                                'PostgreSQL schema',
+                                migration['schema'],
+                            )
+
+                            m2.metric(
+                                'Tables migrated',
+                                migration['table_count'],
+                            )
+
+                            m3.metric(
+                                'Rows migrated',
+                                migration['row_count'],
+                            )
+
+                            st.dataframe(
+                                pd.DataFrame(
+                                    migration['tables']
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                            st.caption(
+                                'The uploaded database is now available on the Ask page.'
+                            )
+
+                        except Exception as exc:
+                            st.error(
+                                f'Migration failed: {exc}'
+                            )
 
             st.markdown(
                 '</div>',
@@ -686,11 +861,20 @@ elif page == 'ML prediction':
                     output = train_models(results)
                     st.session_state['ml_metrics'] = output['metrics']
                     st.session_state['ml_predictions'] = output['predictions']
+                    st.session_state['ml_evaluation_info'] = output.get(
+                        'evaluation_info'
+                    )
                 except Exception as exc:
                     st.error(str(exc))
         st.markdown('</div>', unsafe_allow_html=True)
         metrics = st.session_state.get('ml_metrics')
         predictions = st.session_state.get('ml_predictions')
+        evaluation_info = st.session_state.get('ml_evaluation_info')
+
+        if evaluation_info:
+            with st.expander('ML evaluation setup'):
+                st.json(evaluation_info)
+
         if metrics is not None:
             st.subheader('Model performance')
             st.dataframe(metrics.round(4), use_container_width=True, hide_index=True)
